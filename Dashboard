@@ -1,0 +1,761 @@
+import subprocess
+import sys
+
+from streamlit.runtime import exists as streamlit_is_running
+
+if not streamlit_is_running():
+    import socket
+    import time as _time
+    import webbrowser
+
+    with socket.socket() as _s:
+        _s.bind(("127.0.0.1", 0))
+        _port = _s.getsockname()[1]
+
+    _extra = {}
+    if sys.stdout is None:
+        _extra = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
+                  "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+
+    _proc = subprocess.Popen(
+        [sys.executable, "-m", "streamlit", "run", __file__,
+         "--server.headless", "true", "--server.port", str(_port),
+         "--browser.gatherUsageStats", "false"],
+        **_extra,
+    )
+
+    _url = f"http://localhost:{_port}"
+    for _ in range(120):
+        if _proc.poll() is not None:
+            sys.exit(_proc.returncode)
+        try:
+            with socket.create_connection(("127.0.0.1", _port), timeout=0.5):
+                break
+        except OSError:
+            _time.sleep(0.25)
+    webbrowser.open_new_tab(_url)
+
+    try:
+        _proc.wait()
+    except KeyboardInterrupt:
+        _proc.terminate()
+    sys.exit()
+
+import functools
+import html
+import io
+import json
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import altair as alt
+import numpy as np
+import pandas as pd
+import requests
+import streamlit as st
+from PIL import Image, ImageOps
+
+st.set_page_config(page_title="HUNCH Plant Monitor", layout="wide")
+
+SHEET_ID = "1uKWlNYM0f3s-XUxW0JQDllVdEjgWDoiJEdmAnn_B2E8"
+SHEET_GID = "0"
+SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={SHEET_GID}"
+REFRESH_EVERY = "15s"
+
+COLUMNS = {
+    "Temperature (°C)": "Temp",
+    "Humidity (calibrated)": "Humidity (Calibrated)",
+    "Soil (calibrated)": "Soil (Calibrated)",
+    "Humidity (raw)": "Humidity (Raw)",
+    "Soil (raw)": "Soil (Raw)",
+    "Light (raw)": "Light (Raw)",
+}
+TREND_COLUMNS = ["Temp", "Humidity (Calibrated)", "Soil (Calibrated)"]
+RAW_TREND_COLUMNS = ["Humidity (Raw)", "Soil (Raw)", "Light (Raw)"]
+
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_FILES = {
+    "Minzuna": BASE_DIR / "minzuna_model.pt",
+    "Red Romaine": BASE_DIR / "red_romaine_model.pt",
+    "Microgreen": BASE_DIR / "microgreen_model.pt",
+}
+TRAIN_SCRIPTS = {
+    "Minzuna": "minzuna_train.py",
+    "Red Romaine": "red_romaine_train.py",
+    "Microgreen": "microgreen_train.py",
+}
+
+MIN_CONFIDENCE = 0.60
+
+TIE_MARGIN = 0.05
+
+MIN_VIEWS = 1
+WIN_MARGIN = 0.0
+
+LAST_DEBUG = {}
+
+SERVICE_ACCOUNT_FILE = str(BASE_DIR / "service_account.json")
+FOLDER_ID = "1VRgReEXDkUWvmmv8xHT0JLmvqrErneyG"
+DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+CACHE_FILE = str(BASE_DIR / "drive_scan_cache.json")
+REPORT_HOURS = 72
+PALETTE = ["#2f6f5e", "#4f7cac", "#c08a3e", "#7a6a9a", "#8a8f98"]
+
+LOCAL_TZ = datetime.now().astimezone().tzinfo
+
+st.markdown(
+    """
+    <style>
+    .stApp { background: #ffffff; }
+    h1, h2, h3, p, label, span, div { color: #1f2937; }
+    .card { border-radius: 18px; padding: 22px 24px; margin-top: 6px;
+            border: 1px solid rgba(0,0,0,.10); }
+    .match { background: linear-gradient(135deg, #14532d, #166534); border-color: #22c55e; }
+    .nomatch { background: linear-gradient(135deg, #5b2a14, #7c2d12); border-color: #fb923c; }
+    .card .label, .card .sub { color: #ffffff; }
+    .label { font-size: 2rem; font-weight: 800; margin: 0; }
+    .sub { margin: 4px 0 0 0; }
+    .meter { position: relative; height: 16px; border-radius: 999px;
+             background: rgba(0,0,0,.10); margin: 22px 0 8px 0; }
+    .fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, #86efac, #22c55e); }
+    .mark { position: absolute; top: -6px; width: 3px; height: 28px; background: #f59e0b; border-radius: 2px; }
+    .scale { display: flex; justify-content: space-between; color: #6b7280; font-size: .8rem; }
+    .scale span { color: #6b7280; }
+    .stTabs [data-baseweb="tab"] { font-weight: 600; }
+
+    .dash-title { font-size: 1.35rem; font-weight: 600; color: #1d2733; margin: 0; }
+    .dash-sub { font-size: 0.82rem; color: #6b7785; margin: 2px 0 0 0; }
+    .kpi { background: #ffffff; border: 1px solid #dde2e8; border-radius: 4px; padding: 14px 18px; }
+    .kpi-label { font-size: 0.72rem; letter-spacing: 0.06em; text-transform: uppercase; color: #6b7785; }
+    .kpi-value { font-size: 1.7rem; font-weight: 600; color: #1d2733; line-height: 1.25; }
+    .section { font-size: 0.74rem; letter-spacing: 0.07em; text-transform: uppercase;
+               color: #55616e; font-weight: 600; margin: 22px 0 8px 0; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.title("Plant Growth Dashboard")
+st.caption("AI Plant Growth for Space | NASA HUNCH")
+
+
+@st.cache_data(ttl=10)
+def load_data():
+    r = requests.get(
+        SHEET_URL,
+        params={"_": int(time.time())},
+        headers={"Cache-Control": "no-cache", "Pragma": "no-cache"},
+        timeout=20,
+        allow_redirects=True,
+    )
+    r.raise_for_status()
+    text = r.content.decode("utf-8-sig", errors="replace")
+    if text.lstrip().lower().startswith(("<!doctype", "<html")):
+        raise ValueError("Google returned a web page, not data. Set the sheet to "
+                         "'Anyone with the link can view'.")
+    return pd.read_csv(io.StringIO(text))
+
+
+def parse_timestamps(dates, times):
+    """Combine the sheet's Date and Time columns into one datetime column."""
+    combined = dates.astype(str).str.strip() + " " + times.astype(str).str.strip()
+    try:
+        return pd.to_datetime(combined, errors="coerce", format="mixed")
+    except (TypeError, ValueError):
+        return pd.to_datetime(combined, errors="coerce")
+
+
+@st.fragment(run_every=REFRESH_EVERY)
+def dashboard():
+    try:
+        df = load_data()
+        df.columns = df.columns.astype(str).str.strip()
+    except Exception as e:
+        st.error(f"Couldn't read the sheet: {e}")
+        return
+
+    with st.expander("Columns found in your sheet"):
+        st.write(list(df.columns))
+
+    missing = [c for c in COLUMNS.values() if c not in df.columns]
+    if missing:
+        st.error(f"These columns aren't in the sheet: {missing}")
+        return
+
+    for col in COLUMNS.values():
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna(subset=list(COLUMNS.values()), how="all")
+    if df.empty:
+        st.warning("The sheet has no readings yet.")
+        return
+
+    if {"Date", "Time"}.issubset(df.columns):
+        ts = parse_timestamps(df["Date"], df["Time"])
+        if ts.notna().any():
+            df["Timestamp"] = ts
+            df = df[df["Timestamp"].notna()].set_index("Timestamp").sort_index()
+            st.caption(f"Last reading: {df.index[-1]:%b %d, %I:%M %p}")
+        else:
+            st.warning("Couldn't read the Date/Time columns; showing readings by row number.")
+
+    st.caption(f"{len(df)} readings loaded | refreshes every {REFRESH_EVERY} | "
+               f"checked at {datetime.now():%I:%M:%S %p}")
+
+    st.subheader("Averages (all readings)")
+    cols = st.columns(len(COLUMNS))
+    for c, (label, name) in zip(cols, COLUMNS.items()):
+        c.metric(label, f"{df[name].mean():.1f}")
+
+    st.subheader("Latest reading")
+    cols = st.columns(len(COLUMNS))
+    for c, (label, name) in zip(cols, COLUMNS.items()):
+        latest = df[name].dropna().iloc[-1]
+        avg = df[name].mean()
+        c.metric(label, f"{latest:.1f}", delta=f"{latest - avg:+.1f} vs avg")
+
+    st.subheader("Trends")
+    st.line_chart(df[TREND_COLUMNS].tail(200))
+
+    st.subheader("Raw sensor trends")
+    st.line_chart(df[RAW_TREND_COLUMNS].tail(200))
+
+    with st.expander("Show recent rows"):
+        st.dataframe(df.tail(20))
+
+
+def model_status():
+    found = [name for name, path in MODEL_FILES.items() if path.is_file()]
+    missing = [name for name in MODEL_FILES if name not in found]
+    return found, missing
+
+
+@functools.lru_cache(maxsize=1)
+def _build_scanner():
+    import torch
+    from torchvision import models
+
+    net = models.mobilenet_v3_large(weights=models.MobileNet_V3_Large_Weights.DEFAULT)
+    net.classifier = torch.nn.Identity()
+    net.eval()
+    classes, protos, cutoffs = [], [], []
+    for plant, path in MODEL_FILES.items():
+        if not path.is_file():
+            continue
+        data = torch.load(path, weights_only=False)
+        if "prototypes" in data:
+            classes += list(data["classes"])
+            protos.append(np.asarray(data["prototypes"]))
+            cutoffs.append(np.asarray(data["thresholds"]))
+        else:
+            classes.append(plant)
+            protos.append(np.asarray(data["prototype"])[None, :])
+            cutoffs.append(np.asarray([data["threshold"]]))
+    if not classes:
+        raise FileNotFoundError("No model files found next to AI_dashboard.py")
+    cutoffs = np.maximum(np.concatenate(cutoffs), MIN_CONFIDENCE)
+    return net, {"classes": classes, "protos": np.concatenate(protos), "cutoffs": cutoffs}
+
+
+@st.cache_resource(show_spinner="Loading model...")
+def load_scanner():
+    return _build_scanner()
+
+
+def make_crops(img):
+    """The whole photo plus a 2x2 and a 3x3 grid of tiles, so several plants in one
+    photo each get a chance to show up on their own."""
+    img = ImageOps.exif_transpose(img).convert("RGB")
+    w, h = img.size
+    crops = [img]
+    for n in (2, 3):
+        for r in range(n):
+            for c in range(n):
+                box = (c * w // n, r * h // n, (c + 1) * w // n, (r + 1) * h // n)
+                crops.append(img.crop(box))
+    return crops
+
+
+def get_fingerprints(net, imgs):
+    import torch
+    from torchvision import transforms
+
+    prep = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+    batch = torch.stack([prep(i) for i in imgs])
+    with torch.no_grad():
+        vecs = net(batch)
+    vecs = vecs / vecs.norm(dim=1, keepdim=True)
+    return vecs.numpy()
+
+
+def classify_multi(net, info, img, tie_margin=None):
+    """Finds the known plant types in the photo using competitive voting.
+
+    Each view (whole photo + tiles) votes for ONE plant: the one whose similarity is
+    highest above its own cutoff. The vote only counts if that plant clears its cutoff
+    and beats the runner-up by at least WIN_MARGIN. A plant is identified only if it
+    wins at least MIN_VIEWS views. Look-alike cultivars therefore can't pass on a single
+    lucky tile; the real plant wins many views, a look-alike wins few or none.
+
+    Returns (detections, closest, class_best):
+      detections: list of dicts {label, score, cutoff, crops}, most views first
+                  ("crops" = number of views this plant won)
+      closest:    (label, score, cutoff) for the best overall fit, even if not matched
+      class_best: best score seen for each known plant, same order as info["classes"]
+    """
+    fps = get_fingerprints(net, make_crops(img))
+    scores = fps @ info["protos"].T
+    cutoffs = info["cutoffs"]
+    class_best = scores.max(axis=0)
+
+    over = scores - cutoffs
+    n_views, n_cls = over.shape
+    winner = over.argmax(axis=1)
+    if n_cls > 1:
+        srt = np.sort(over, axis=1)
+        gap = srt[:, -1] - srt[:, -2]
+    else:
+        gap = np.full(n_views, np.inf)
+
+    wins = np.zeros(n_cls, dtype=int)
+    for v in range(n_views):
+        if over[v, winner[v]] >= 0 and gap[v] >= WIN_MARGIN:
+            wins[winner[v]] += 1
+
+    LAST_DEBUG.clear()
+    LAST_DEBUG.update({
+        "classes": list(info["classes"]),
+        "wins": wins.tolist(),
+        "views_above_cutoff": (over >= 0).sum(axis=0).tolist(),
+        "best_gap": float(gap[np.isfinite(gap)].max()) if np.isfinite(gap).any() else 0.0,
+        "median_gap": float(np.median(gap[np.isfinite(gap)])) if np.isfinite(gap).any() else 0.0,
+    })
+
+    detections = []
+    for k, label in enumerate(info["classes"]):
+        if wins[k] >= MIN_VIEWS:
+            detections.append({
+                "label": label,
+                "score": float(class_best[k]),
+                "cutoff": float(cutoffs[k]),
+                "crops": int(wins[k]),
+            })
+    detections.sort(key=lambda d: d["crops"], reverse=True)
+
+    margins = class_best - cutoffs
+    k = int(margins.argmax())
+    closest = (info["classes"][k], float(class_best[k]), float(cutoffs[k]))
+    return detections, closest, class_best
+
+
+def meter_html(score, cutoff):
+    fill = max(0.0, min(1.0, score)) * 100
+    mark = max(0.0, min(1.0, cutoff)) * 100
+    return (
+        f'<div class="meter"><div class="fill" style="width:{fill:.1f}%"></div>'
+        f'<div class="mark" style="left:{mark:.1f}%"></div></div>'
+        '<div class="scale"><span>0.0 no match</span>'
+        '<span>cutoff</span><span>strong match 1.0</span></div>'
+    )
+
+
+def scanner():
+    found, missing = model_status()
+    if not found:
+        st.error("Could not find any model files in: " + str(BASE_DIR))
+        return
+
+    st.caption("Recognizes: " + ", ".join(found))
+
+    tab_upload, tab_camera = st.tabs(["Upload a photo", "Use the camera"])
+    img = None
+    with tab_upload:
+        up = st.file_uploader("Choose a photo", type=["jpg", "jpeg", "png", "webp"],
+                              label_visibility="collapsed", key="scan_upload")
+        if up:
+            img = Image.open(up)
+    with tab_camera:
+        shot = st.camera_input("Take a photo", label_visibility="collapsed", key="scan_cam")
+        if shot and img is None:
+            img = Image.open(shot)
+
+    if img is None:
+        return
+
+    net, info = load_scanner()
+    with st.spinner("Scanning..."):
+        detections, closest, class_best = classify_multi(net, info, img)
+
+    left, right = st.columns([1, 1.2], gap="large")
+    with left:
+        st.image(ImageOps.exif_transpose(img), width="stretch")
+    with right:
+        if detections:
+            st.subheader(f"{len(detections)} plant type{'s' if len(detections) != 1 else ''} identified")
+            for d in detections:
+                st.markdown(
+                    f'<div class="card match"><p class="label">{html.escape(d["label"])}</p>'
+                    f'<p class="sub">Plant identified | best similarity {d["score"]:.3f} '
+                    f'(needs {d["cutoff"]:.3f}) | won {d["crops"]} of 14 views</p></div>',
+                    unsafe_allow_html=True,
+                )
+            top = detections[0]
+            st.markdown(meter_html(top["score"], top["cutoff"]), unsafe_allow_html=True)
+        else:
+            label, score, cutoff = closest
+            st.markdown(
+                '<div class="card nomatch"><p class="label">Not recognized</p>'
+                f'<p class="sub">Closest: {html.escape(label)} | similarity {score:.3f} (needs {cutoff:.3f})</p></div>',
+                unsafe_allow_html=True,
+            )
+            st.markdown(meter_html(score, cutoff), unsafe_allow_html=True)
+
+    st.subheader("Best score for each plant")
+    for name, s, cut in zip(info["classes"], class_best, info["cutoffs"]):
+        status = "identified" if any(d["label"] == name for d in detections) else "not found"
+        st.progress(float(max(0.0, min(1.0, s))), text=f"{name}: {s:.3f} (needs {cut:.3f}) - {status}")
+
+    with st.expander("Tuning details"):
+        if LAST_DEBUG:
+            st.write(pd.DataFrame({
+                "plant": LAST_DEBUG["classes"],
+                "views won": LAST_DEBUG["wins"],
+                "views above own cutoff": LAST_DEBUG["views_above_cutoff"],
+            }))
+            st.caption(f"Winner-vs-runner-up gap across views: median {LAST_DEBUG['median_gap']:.3f}, "
+                       f"largest {LAST_DEBUG['best_gap']:.3f} | MIN_VIEWS={MIN_VIEWS}, WIN_MARGIN={WIN_MARGIN}")
+
+
+def get_drive_service():
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+
+    creds = service_account.Credentials.from_service_account_file(
+        SERVICE_ACCOUNT_FILE, scopes=DRIVE_SCOPES
+    )
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def list_jpgs(service, folder_id=FOLDER_ID):
+    files, page_token = [], None
+    query = (
+        f"'{folder_id}' in parents and trashed = false "
+        "and (mimeType = 'image/jpeg' or name contains '.jpg' or name contains '.jpeg')"
+    )
+    while True:
+        resp = service.files().list(
+            q=query,
+            fields="nextPageToken, files(id, name, modifiedTime, createdTime, imageMediaMetadata(time))",
+            pageSize=100,
+            pageToken=page_token,
+            orderBy="modifiedTime desc",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+        files.extend(resp.get("files", []))
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return files
+
+
+def download_image(service, file_id):
+    from googleapiclient.http import MediaIoBaseDownload
+
+    request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    buf.seek(0)
+    return Image.open(buf).convert("RGB")
+
+
+def parse_photo_time(f):
+    """When the photo was taken (local time) plus where that came from.
+    Camera EXIF time if present, else Drive's createdTime. (None, None) if neither."""
+    exif_time = (f.get("imageMediaMetadata") or {}).get("time")
+    if exif_time:
+        try:
+            dt = datetime.strptime(exif_time.strip(), "%Y:%m:%d %H:%M:%S")
+            return dt.replace(tzinfo=LOCAL_TZ), "camera"
+        except ValueError:
+            pass
+    created = f.get("createdTime")
+    if created:
+        try:
+            dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            return dt.astimezone(LOCAL_TZ), "drive_created"
+        except ValueError:
+            pass
+    return None, None
+
+
+def identify_plants(img, tie_margin=TIE_MARGIN):
+    """Scores one photo against every plant model (shares the Scanner's loaded model)."""
+    net, info = load_scanner()
+    fps = get_fingerprints(net, make_crops(img))
+    scores = fps @ info["protos"].T
+    cutoffs = info["cutoffs"]
+    class_best = scores.max(axis=0)
+    margins = class_best - cutoffs
+    strongest = margins.max()
+
+    out = []
+    for k, name in enumerate(info["classes"]):
+        out.append({
+            "plant": name,
+            "similarity": round(float(class_best[k]), 3),
+            "threshold": round(float(cutoffs[k]), 3),
+            "crops": int((scores[:, k] >= cutoffs[k]).sum()),
+            "match": bool(margins[k] >= 0 and margins[k] >= strongest - tie_margin),
+            "_margin": float(margins[k]),
+        })
+    out.sort(key=lambda d: d["_margin"], reverse=True)
+    for d in out:
+        del d["_margin"]
+    return out
+
+
+def _load_cache():
+    try:
+        return json.loads(Path(CACHE_FILE).read_text())
+    except Exception:
+        return {}
+
+
+def scan_drive(hours=None):
+    """Identifies plants in the Drive photos taken in the last `hours` hours."""
+    service = get_drive_service()
+    cache = _load_cache()
+    results = []
+
+    files = list_jpgs(service)
+    cutoff = datetime.now(LOCAL_TZ) - timedelta(hours=hours) if hours else None
+    candidates = []
+    for f in files:
+        taken_dt, source = parse_photo_time(f)
+        if cutoff and (taken_dt is None or taken_dt < cutoff):
+            continue
+        candidates.append((f, taken_dt, source))
+    candidates.sort(key=lambda c: c[1] or datetime.min.replace(tzinfo=LOCAL_TZ), reverse=True)
+
+    for f, taken_dt, source in candidates:
+        key = f"{f['id']}|{f['modifiedTime']}"
+        if key in cache:
+            results.append(cache[key])
+            continue
+        try:
+            img = download_image(service, f["id"])
+            scores = identify_plants(img)
+        except Exception as e:
+            print(f"[error] {f['name']}: {e}")
+            continue
+        entry = {
+            "file": f["name"],
+            "id": f["id"],
+            "modified": f["modifiedTime"],
+            "taken": taken_dt.isoformat() if taken_dt else None,
+            "taken_source": source,
+            "plants": [s for s in scores if s["match"]],
+            "scores": scores,
+        }
+        results.append(entry)
+        cache[key] = entry
+
+    Path(CACHE_FILE).write_text(json.dumps(cache))
+    return results
+
+
+@st.cache_data(ttl=300, show_spinner="Loading data")
+def run_scan(hours: int, refresh_token: int):
+    return scan_drive(hours=hours)
+
+
+def build_frame(results):
+    rows = []
+    for r in results:
+        rows.append({
+            "file": r["file"],
+            "id": r["id"],
+            "taken": r["taken"],
+            "source": r["taken_source"],
+            "plants": [p["plant"] for p in r["plants"]],
+            "top_score": r["scores"][0]["similarity"] if r["scores"] else None,
+            "top_needs": r["scores"][0]["threshold"] if r["scores"] else None,
+            "confidence": max((p["similarity"] for p in r["plants"]), default=None),
+            "margin": max((p["similarity"] - p["threshold"] for p in r["plants"]), default=None),
+            "plant_sims": {p["plant"]: p["similarity"] for p in r["plants"]},
+        })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df = df.dropna(subset=["taken"])
+    if df.empty:
+        return df
+    df["taken"] = pd.to_datetime(df["taken"], utc=True).dt.tz_convert(LOCAL_TZ)
+    df["identified"] = df["plants"].apply(len) > 0
+    df["result"] = df.apply(
+        lambda x: ", ".join(x["plants"]) if x["identified"] else "No match", axis=1
+    )
+    return df.sort_values("taken", ascending=False).reset_index(drop=True)
+
+
+def kpi(col, label, value):
+    col.markdown(
+        f'<div class="kpi"><div class="kpi-label">{label}</div>'
+        f'<div class="kpi-value">{value}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def section(text):
+    st.markdown(f'<div class="section">{text}</div>', unsafe_allow_html=True)
+
+
+def report_72h():
+    if "refresh_token" not in st.session_state:
+        st.session_state.refresh_token = 0
+
+    if not st.session_state.get("report_loaded"):
+        if st.button("Load 72-hour report", key="report_load"):
+            st.session_state.report_loaded = True
+            st.rerun()
+        return
+
+    head_l, head_r = st.columns([6, 1])
+    with head_l:
+        st.markdown(
+            '<p class="dash-title">Plant Identification</p>'
+            f'<p class="dash-sub">Last {REPORT_HOURS} hours &nbsp;|&nbsp; '
+            f'Updated {datetime.now().strftime("%b %d, %I:%M %p")}</p>',
+            unsafe_allow_html=True,
+        )
+    with head_r:
+        if st.button("Refresh", width="stretch", key="report_refresh"):
+            st.session_state.refresh_token += 1
+            st.cache_data.clear()
+
+    if not model_status()[0]:
+        st.error("No plant models could be loaded.")
+        return
+
+    try:
+        results = run_scan(REPORT_HOURS, st.session_state.refresh_token)
+    except Exception as e:
+        st.error(f"Data could not be loaded: {e}")
+        return
+
+    df = build_frame(results)
+    if df.empty:
+        st.info(f"No photos in the last {REPORT_HOURS} hours.")
+        return
+
+    total = len(df)
+    identified = int(df["identified"].sum())
+    unmatched = total - identified
+
+    section("Summary")
+    conf = df.loc[df["identified"], "confidence"].dropna()
+    margin = df.loc[df["identified"], "margin"].dropna()
+    avg_conf = f"{conf.mean() * 100:.1f}%" if not conf.empty else "n/a"
+    weak = int((margin < 0.05).sum()) if not margin.empty else 0
+
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    kpi(k1, "Photos", total)
+    kpi(k2, "Identified", identified)
+    kpi(k3, "No match", unmatched)
+    kpi(k4, "Avg confidence", avg_conf)
+    kpi(k5, "Weak matches", weak)
+    kpi(k6, "Latest photo", df["taken"].iloc[0].strftime("%b %d, %I:%M %p"))
+
+    exploded = df.explode("plants").dropna(subset=["plants"])
+    plant_order = list(load_scanner()[1]["classes"])
+    color_scale = alt.Scale(domain=plant_order, range=PALETTE[: len(plant_order)])
+
+    if not exploded.empty:
+        left, right = st.columns(2)
+
+        with left:
+            section("Photos by plant")
+            counts = exploded["plants"].value_counts().rename_axis("plant").reset_index(name="photos")
+            bar = (
+                alt.Chart(counts)
+                .mark_bar(size=46)
+                .encode(
+                    x=alt.X("plant:N", sort="-y", title=None, axis=alt.Axis(labelAngle=0)),
+                    y=alt.Y("photos:Q", title=None, axis=alt.Axis(tickMinStep=1)),
+                    color=alt.Color("plant:N", scale=color_scale, legend=None),
+                    tooltip=[alt.Tooltip("plant:N", title="Plant"), alt.Tooltip("photos:Q", title="Photos")],
+                )
+                .properties(height=270)
+                .configure_view(strokeWidth=0)
+                .configure_axis(grid=True, gridColor="#e6e9ed", domain=False, labelColor="#55616e")
+            )
+            st.altair_chart(bar, width="stretch")
+
+        with right:
+            section("Activity (6-hour intervals)")
+            ex = exploded.copy()
+            ex["interval"] = ex["taken"].dt.floor("6h").dt.tz_localize(None)
+            timeline = ex.groupby(["interval", "plants"]).size().reset_index(name="photos")
+            area = (
+                alt.Chart(timeline)
+                .mark_bar()
+                .encode(
+                    x=alt.X("interval:T", title=None, axis=alt.Axis(format="%b %d %I %p", labelAngle=-30)),
+                    y=alt.Y("photos:Q", title=None, axis=alt.Axis(tickMinStep=1)),
+                    color=alt.Color("plants:N", scale=color_scale, legend=alt.Legend(title=None, orient="top")),
+                    tooltip=[
+                        alt.Tooltip("interval:T", title="Interval", format="%b %d, %I %p"),
+                        alt.Tooltip("plants:N", title="Plant"),
+                        alt.Tooltip("photos:Q", title="Photos"),
+                    ],
+                )
+                .properties(height=270)
+                .configure_view(strokeWidth=0)
+                .configure_axis(grid=True, gridColor="#e6e9ed", domain=False, labelColor="#55616e")
+            )
+            st.altair_chart(area, width="stretch")
+
+    section("Photo log")
+    table = pd.DataFrame({
+        "Taken": df["taken"].dt.strftime("%b %d, %I:%M %p"),
+        "File": df["file"],
+        "Result": df["result"],
+        "Score": df["top_score"],
+        "Cutoff": df["top_needs"],
+        "Confidence": df["confidence"],
+    })
+    st.dataframe(
+        table,
+        hide_index=True,
+        width="stretch",
+        height=380,
+        column_config={
+            "Score": st.column_config.NumberColumn(format="%.3f"),
+            "Cutoff": st.column_config.NumberColumn(format="%.3f"),
+            "Confidence": st.column_config.ProgressColumn(
+                format="%.3f", min_value=0.0, max_value=1.0,
+            ),
+        },
+    )
+
+
+live_tab, scan_tab, report_tab = st.tabs(["Live Dashboard", "Plant Scanner", "72-Hour Report"])
+
+with live_tab:
+    dashboard()
+
+with scan_tab:
+    scanner()
+
+with report_tab:
+    report_72h()
