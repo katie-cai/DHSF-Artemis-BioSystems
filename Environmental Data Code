@@ -1,0 +1,504 @@
+#include <rpcWiFi.h>
+#include <WiFiClientSecure.h>
+#include <WiFiUdp.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <TFT_eSPI.h>
+#include <DHT.h>
+#include <SPI.h>
+#include <Seeed_FS.h>
+#include "SD/Seeed_SD.h"
+#include <Adafruit_SleepyDog.h>
+#include <time.h>
+
+#define DHTPIN PIN_WIRE_SCL
+#define DHTTYPE DHT11
+#define WIFI_SSID // hidden
+#define WIFI_PASSWORD // hidden
+#define GOOGLE_SCRIPT_URL // hidden
+#define SECRET_TOKEN // hidden
+
+const char* ROOT_CA = R"(
+-----BEGIN CERTIFICATE-----
+...
+-----END CERTIFICATE-----
+)";
+
+const char* deviceId = "WIO2";
+const char* csvFile = "WIO2CAL.CSV";
+const char* csvHeader =
+  "device_id,uptime_s,date,time,temp_c,humidity_raw,humidity_cal,"
+  "soil_raw,soil_pct,light_raw,light_pct";
+
+const long timezoneOffsetSeconds = -5L * 3600L;
+
+const float humidityGain = 1.0;
+const float humidityOffset = 13.0;
+
+const int maxReadings = 15;
+const int maxPerUpload = 6;
+
+const unsigned long readingInterval = 60000UL;
+const unsigned long readingExpiry = 15UL * 60000UL;
+const unsigned long uploadRetryInterval = 10000UL;
+const unsigned long maxUploadDelay = 60000UL;
+const unsigned long wifiRetryInterval = 15000UL;
+const unsigned long wifiStableTime = 5000UL;
+const unsigned long timeResyncInterval = 3600000UL;
+const unsigned long timeRetryInterval = 30000UL;
+const int failuresBeforeWifiReset = 6;
+
+#define BG_COLOR       0x0000
+#define TEXT_COLOR     0xFFFF
+#define SUBTEXT_COLOR  0xBDF7
+#define TEMP_COLOR     0xFDD6
+#define HUMIDITY_COLOR 0xBDF7
+#define SOIL_COLOR     0xDFF2
+#define LIGHT_COLOR    0xFFF0
+
+struct Reading {
+  float temp;
+  float humidity;
+  int soil;
+  int light;
+  unsigned long takenAt;
+};
+
+TFT_eSPI tft;
+DHT dht(DHTPIN, DHTTYPE);
+
+Reading buffer[maxReadings];
+int readingCount = 0;
+
+unsigned long lastReadingAt = 0;
+unsigned long lastUploadAttemptAt = 0;
+unsigned long lastWifiAttemptAt = 0;
+unsigned long lastTimeAttemptAt = 0;
+unsigned long lastTimeSyncAt = 0;
+unsigned long wifiUpSince = 0;
+
+unsigned long uploadDelay = uploadRetryInterval;
+int consecutiveFailures = 0;
+
+bool wifiWasUp = false;
+bool sdReady = false;
+int shownWifi = -1;
+int shownSd = -1;
+
+bool timeSynced = false;
+uint32_t ntpEpoch = 0;
+unsigned long ntpMillis = 0;
+
+float calibratedHumidity(float raw) {
+  return constrain(raw * humidityGain + humidityOffset, 0, 100);
+}
+
+int soilPercent(int raw) {
+  if (raw < 300) return -1;
+  return constrain(map(raw, 1023, 500, 0, 100), 0, 100);
+}
+
+int lightPercent(int raw) {
+  return constrain(map(raw, 0, 1023, 0, 100), 0, 100);
+}
+
+bool readDHT(float& temp, float& humidity) {
+  for (int attempt = 0; attempt < 2; attempt++) {
+    temp = dht.readTemperature();
+    humidity = dht.readHumidity();
+
+    if (!isnan(temp) && !isnan(humidity) && humidity >= 1 && humidity <= 100 && temp > -20 && temp < 60) {
+      return true;
+    }
+    delay(2000);
+  }
+  return false;
+}
+
+void drawCard(int x, int y, int w, int h, uint16_t color) {
+  tft.fillRoundRect(x, y, w, h, 10, BG_COLOR);
+  tft.drawRoundRect(x, y, w, h, 10, color);
+  tft.fillRoundRect(x + 4, y + 4, 4, h - 8, 2, color);
+}
+
+void drawLabel(const char* label, int x, int y) {
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(SUBTEXT_COLOR);
+  tft.setTextSize(1);
+  tft.drawString(label, x, y);
+}
+
+void drawValue(int x, int y, int value, const char* unit, bool valid, uint16_t color) {
+  tft.fillRect(x - 62, y - 19, 125, 35, BG_COLOR);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(color);
+  tft.setTextSize(3);
+
+  if (valid) {
+    tft.drawNumber(value, x - 10, y);
+    tft.setTextSize(1);
+    tft.drawString(unit, x + 28, y);
+  } else {
+    tft.drawString("n/a", x, y);
+  }
+}
+
+void drawStatus(bool wifiOk) {
+  tft.fillRect(0, 210, 320, 30, BG_COLOR);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextSize(1);
+
+  tft.setTextColor(wifiOk ? SOIL_COLOR : TEMP_COLOR, BG_COLOR);
+  tft.drawString(wifiOk ? "wifi: online" : "wifi: offline", 100, 222);
+
+  tft.setTextColor(sdReady ? SOIL_COLOR : TEMP_COLOR, BG_COLOR);
+  tft.drawString(sdReady ? "sd: success" : "sd: fail", 220, 222);
+
+  shownWifi = wifiOk ? 1 : 0;
+  shownSd = sdReady ? 1 : 0;
+}
+
+void syncTime() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  WiFiUDP udp;
+  if (!udp.begin(2390)) return;
+
+  byte packet[48];
+  memset(packet, 0, 48);
+  packet[0] = 0xE3;
+  packet[2] = 6;
+  packet[3] = 0xEC;
+  packet[12] = 49;
+  packet[13] = 0x4E;
+  packet[14] = 49;
+  packet[15] = 52;
+
+  udp.beginPacket("pool.ntp.org", 123);
+  udp.write(packet, 48);
+  udp.endPacket();
+
+  unsigned long startedWaiting = millis();
+  while (millis() - startedWaiting < 3000) {
+    if (udp.parsePacket() >= 48) {
+      udp.read(packet, 48);
+
+      uint32_t ntpSeconds = ((uint32_t)packet[40] << 24) | ((uint32_t)packet[41] << 16) | ((uint32_t)packet[42] << 8) | (uint32_t)packet[43];
+
+      if (ntpSeconds > 2208988800UL) {
+        ntpEpoch = ntpSeconds - 2208988800UL;
+        ntpMillis = millis();
+        lastTimeSyncAt = millis();
+        timeSynced = true;
+      }
+      break;
+    }
+    delay(50);
+  }
+
+  udp.stop();
+}
+
+void setupSD() {
+  sdReady = SD.begin(SDCARD_SS_PIN, SDCARD_SPI);
+
+  if (sdReady && !SD.exists(csvFile)) {
+    File file = SD.open(csvFile, FILE_APPEND);
+    if (file) {
+      file.println(csvHeader);
+      file.close();
+    } else {
+      sdReady = false;
+    }
+  }
+
+  Serial.println(sdReady ? "sd card ready" : "sd card not available");
+}
+
+void saveRow(const Reading& r) {
+  if (!sdReady) return;
+
+  File file = SD.open(csvFile, FILE_APPEND);
+  if (!file) {
+    Serial.println("could not write to sd card");
+    return;
+  }
+
+  char dateText[12] = "NA";
+  char clockText[10] = "NA";
+
+  if (timeSynced) {
+    long secondsSinceSync = (millis() - ntpMillis) / 1000UL;
+    time_t localTime = (time_t)((long)ntpEpoch + secondsSinceSync + timezoneOffsetSeconds);
+    struct tm* parts = gmtime(&localTime);
+
+    snprintf(dateText, sizeof(dateText), "%04d.%02d.%02d", parts->tm_year + 1900, parts->tm_mon + 1, parts->tm_mday);
+    snprintf(clockText, sizeof(clockText), "%02d:%02d:%02d", parts->tm_hour, parts->tm_min, parts->tm_sec);
+  }
+
+  int soilPct = soilPercent(r.soil);
+
+  file.print(deviceId);
+  file.print(",");
+  file.print(millis() / 1000UL);
+  file.print(",");
+  file.print(dateText);
+  file.print(",");
+  file.print(clockText);
+  file.print(",");
+  if (!isnan(r.temp)) file.print(r.temp, 1);
+  file.print(",");
+  if (!isnan(r.humidity)) file.print(r.humidity, 1);
+  file.print(",");
+  if (!isnan(r.humidity)) file.print(calibratedHumidity(r.humidity), 1);
+  file.print(",");
+  file.print(r.soil);
+  file.print(",");
+  if (soilPct >= 0) file.print(soilPct);
+  file.print(",");
+  file.print(r.light);
+  file.print(",");
+  file.println(lightPercent(r.light));
+
+  file.close();
+}
+
+void dropOldestReading() {
+  for (int i = 1; i < readingCount; i++) {
+    buffer[i - 1] = buffer[i];
+  }
+  if (readingCount > 0) readingCount--;
+}
+
+bool uploadBatch() {
+  int count = min(readingCount, maxPerUpload);
+  unsigned long now = millis();
+
+  StaticJsonDocument<3072> doc;
+  doc["token"] = SECRET_TOKEN;
+  JsonArray rows = doc.createNestedArray("readings");
+
+  for (int i = 0; i < count; i++) {
+    const Reading& r = buffer[i];
+    JsonObject item = rows.createNestedObject();
+
+    item["temp"] = isnan(r.temp) ? "n/a" : String(r.temp, 1);
+    item["humidity"] = isnan(r.humidity) ? "n/a" : String(r.humidity, 1);
+    item["soil"] = r.soil;
+    item["light"] = r.light;
+    item["humidityCal"] = isnan(r.humidity) ? "n/a" : String(calibratedHumidity(r.humidity), 1);
+
+    int soilPct = soilPercent(r.soil);
+    if (soilPct < 0) item["soilPct"] = "n/a";
+    else item["soilPct"] = soilPct;
+
+    item["lightPct"] = lightPercent(r.light);
+    item["ageMs"] = (unsigned long)(now - r.takenAt);
+  }
+
+  String payload;
+  serializeJson(doc, payload);
+
+  WiFiClientSecure client;
+  client.setCACert(ROOT_CA);
+  HTTPClient https;
+
+  int code = -1;
+  String reply = "";
+  String redirectUrl = "";
+
+  if (https.begin(client, GOOGLE_SCRIPT_URL)) {
+    https.setTimeout(8000);
+    https.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+    https.addHeader("Content-Type", "application/json");
+
+    const char* headersToCollect[] = {"Location"};
+    https.collectHeaders(headersToCollect, 1);
+
+    Watchdog.reset();
+    code = https.POST(payload);
+    Watchdog.reset();
+
+    if (code > 0) {
+      reply = https.getString();
+      redirectUrl = https.header("Location");
+    }
+    https.end();
+  }
+  client.stop();
+
+  bool accepted = (code == 200 && reply.indexOf("OK") >= 0);
+  bool redirected = (code == 301 || code == 302 || code == 303 || code == 307 || code == 308);
+
+  if (!accepted && redirected && redirectUrl.length() > 0) {
+    delay(500);
+    Watchdog.reset();
+    accepted = true;
+
+    HTTPClient check;
+    if (check.begin(client, redirectUrl)) {
+      check.setTimeout(8000);
+      check.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+
+      if (check.GET() == 200) {
+        accepted = check.getString().indexOf("OK") >= 0;
+      }
+      check.end();
+    }
+    client.stop();
+    Watchdog.reset();
+  }
+
+  if (accepted) {
+    Serial.println("upload ok");
+    for (int i = 0; i < count; i++) {
+      dropOldestReading();
+    }
+    consecutiveFailures = 0;
+    uploadDelay = uploadRetryInterval;
+    return true;
+  }
+
+  Serial.print("upload failed, code ");
+  Serial.println(code);
+  consecutiveFailures++;
+  uploadDelay = min(uploadDelay * 2, maxUploadDelay);
+  return false;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  tft.begin();
+  tft.setRotation(3);
+  tft.fillScreen(BG_COLOR);
+
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TEXT_COLOR);
+  tft.setTextSize(2);
+  tft.drawString("plant monitor", tft.width() / 2, 20);
+
+  tft.setTextColor(SUBTEXT_COLOR);
+  tft.setTextSize(1);
+  tft.drawString("environmental conditions", tft.width() / 2, 37);
+
+  drawCard(10, 60, 145, 70, TEMP_COLOR);
+  drawCard(165, 60, 145, 70, HUMIDITY_COLOR);
+  drawCard(10, 140, 145, 70, SOIL_COLOR);
+  drawCard(165, 140, 145, 70, LIGHT_COLOR);
+
+  drawLabel("temp", 82, 75);
+  drawLabel("humidity", 237, 75);
+  drawLabel("soil moisture", 82, 155);
+  drawLabel("light level", 237, 155);
+
+  dht.begin();
+
+  tft.setTextColor(SUBTEXT_COLOR, BG_COLOR);
+  tft.drawString("starting...", 160, 222);
+
+  setupSD();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(500);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long startedWaiting = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startedWaiting < 20000) {
+    delay(500);
+  }
+
+  bool wifiOk = WiFi.status() == WL_CONNECTED;
+  Serial.println(wifiOk ? "wifi connected" : "wifi offline, continuing");
+
+  for (int i = 0; wifiOk && i < 3 && !timeSynced; i++) {
+    syncTime();
+  }
+
+  drawStatus(wifiOk);
+
+  lastUploadAttemptAt = millis();
+  lastWifiAttemptAt = millis();
+  lastTimeAttemptAt = millis();
+
+  Watchdog.enable(16000);
+}
+
+void loop() {
+  Watchdog.reset();
+  unsigned long now = millis();
+
+  bool wifiUp = WiFi.status() == WL_CONNECTED;
+  if (wifiUp && !wifiWasUp) wifiUpSince = now;
+  wifiWasUp = wifiUp;
+
+  if ((int)wifiUp != shownWifi || (int)sdReady != shownSd) {
+    drawStatus(wifiUp);
+  }
+
+  if (!wifiUp && now - lastWifiAttemptAt >= wifiRetryInterval) {
+    lastWifiAttemptAt = now;
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  }
+
+  bool clockDue = !timeSynced || now - lastTimeSyncAt >= timeResyncInterval;
+  if (wifiUp && clockDue && now - lastTimeAttemptAt >= timeRetryInterval) {
+    lastTimeAttemptAt = now;
+    syncTime();
+  }
+
+  if (lastReadingAt == 0 || now - lastReadingAt >= readingInterval) {
+    lastReadingAt = now;
+
+    float temp = NAN;
+    float humidity = NAN;
+    bool dhtValid = readDHT(temp, humidity);
+
+    Reading reading;
+    reading.temp = dhtValid ? temp : NAN;
+    reading.humidity = dhtValid ? humidity : NAN;
+    reading.soil = analogRead(A0);
+    reading.light = analogRead(WIO_LIGHT);
+    reading.takenAt = millis();
+
+    int soilPct = soilPercent(reading.soil);
+    int lightPct = lightPercent(reading.light);
+
+    drawValue(82, 104, dhtValid ? (int)temp : 0, "C", dhtValid, TEMP_COLOR);
+    drawValue(237, 104, dhtValid ? (int)(calibratedHumidity(humidity) + 0.5) : 0, "%", dhtValid, HUMIDITY_COLOR);
+    drawValue(82, 184, soilPct, "%", soilPct != -1, SOIL_COLOR);
+    drawValue(237, 184, lightPct, "%", true, LIGHT_COLOR);
+
+    saveRow(reading);
+
+    if (readingCount >= maxReadings) dropOldestReading();
+    buffer[readingCount] = reading;
+    readingCount++;
+  }
+
+  now = millis();
+
+  while (readingCount > 0 && now - buffer[0].takenAt >= readingExpiry) {
+    dropOldestReading();
+  }
+
+  if (readingCount > 0 && wifiUp && now - wifiUpSince >= wifiStableTime && now - lastUploadAttemptAt >= uploadDelay) {
+    lastUploadAttemptAt = now;
+    uploadBatch();
+  }
+
+  if (consecutiveFailures >= failuresBeforeWifiReset) {
+    WiFi.disconnect();
+    delay(1000);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    consecutiveFailures = 0;
+    uploadDelay = uploadRetryInterval;
+    lastWifiAttemptAt = millis();
+    lastUploadAttemptAt = millis();
+  }
+
+  delay(1000);
+}
