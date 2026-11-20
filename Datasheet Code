@@ -1,0 +1,36 @@
+const SHEET_NAME = "environmental_data";
+const SECRET_TOKEN = ""; // hidden
+
+function doPost(e) {
+  const data = JSON.parse(e.postData.contents);
+
+  if (data.token !== SECRET_TOKEN) {
+    return ContentService.createTextOutput("Unauthorized");
+  }
+
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = spreadsheet.getSheetByName(SHEET_NAME);
+  const timezone = spreadsheet.getSpreadsheetTimeZone();
+  const now = new Date();
+  const rows = [];
+
+  for (const reading of data.readings) {
+    const takenAt = new Date(now.getTime() - reading.ageMs);
+
+    rows.push([
+      Utilities.formatDate(takenAt, timezone, "yyyy.MM.dd"),
+      Utilities.formatDate(takenAt, timezone, "HH:mm:ss"),
+      reading.temp,
+      reading.humidity,
+      reading.soil,
+      reading.light,
+      reading.humidityCal,
+      reading.soilPct,
+      reading.lightPct
+    ]);
+  }
+
+  sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, 9).setValues(rows);
+  return ContentService.createTextOutput("OK");
+}
+
